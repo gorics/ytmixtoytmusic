@@ -11,6 +11,7 @@ import urllib.request
 OUT = pathlib.Path("out")
 OUT.mkdir(exist_ok=True)
 MAX_BYTES = 5 * 1024 * 1024
+RANGE_BYTES = 64 * 1024
 TIMEOUT = 15
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36"
 
@@ -37,19 +38,26 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def fetch(url: str, prefix: str, method="GET", body=None, headers=None):
-    validate_url(url)
-    opener = urllib.request.build_opener(SafeRedirect())
-    req_headers = {
+def opener():
+    return urllib.request.build_opener(SafeRedirect())
+
+
+def base_headers():
+    return {
         "User-Agent": UA,
         "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
         "Accept": "*/*",
     }
+
+
+def fetch(url: str, prefix: str, method="GET", body=None, headers=None):
+    validate_url(url)
+    req_headers = base_headers()
     if headers:
         req_headers.update(headers)
     req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
     started = time.time()
-    with opener.open(req, timeout=TIMEOUT) as resp:
+    with opener().open(req, timeout=TIMEOUT) as resp:
         data = resp.read(MAX_BYTES + 1)
         elapsed = round(time.time() - started, 3)
         truncated = len(data) > MAX_BYTES
@@ -81,6 +89,32 @@ def fetch(url: str, prefix: str, method="GET", body=None, headers=None):
         }
 
 
+def probe_range(url: str, prefix: str):
+    """Read only the first 64 KiB of a public media URL; never expose the signed URL."""
+    p = validate_url(url)
+    headers = base_headers()
+    headers["Range"] = f"bytes=0-{RANGE_BYTES - 1}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    started = time.time()
+    with opener().open(req, timeout=TIMEOUT) as resp:
+        data = resp.read(RANGE_BYTES)
+        h = dict(resp.headers.items())
+        (OUT / f"{prefix}-sample.bin").write_bytes(data)
+        result = {
+            "ok": True,
+            "status": resp.status,
+            "host": p.hostname,
+            "content_type": h.get("Content-Type", ""),
+            "content_length": h.get("Content-Length"),
+            "content_range": h.get("Content-Range"),
+            "accept_ranges": h.get("Accept-Ranges"),
+            "sample_bytes": len(data),
+            "seconds": round(time.time() - started, 3),
+        }
+        (OUT / f"{prefix}-sample.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), "utf-8")
+        return result
+
+
 def safe_fetch(name, url, method="GET", body=None, headers=None):
     try:
         return name, fetch(url, name, method=method, body=body, headers=headers)
@@ -103,10 +137,10 @@ def youtube_id(url: str):
     return None
 
 
-def parse_player_response():
+def extract_player_response():
     path = OUT / "direct.txt"
     if not path.exists():
-        return {"found": False}
+        return None, None
     html = path.read_text("utf-8", errors="replace")
     decoder = json.JSONDecoder()
     for marker in ("var ytInitialPlayerResponse = ", "ytInitialPlayerResponse = ", 'window["ytInitialPlayerResponse"] = ', 'ytInitialPlayerResponse":'):
@@ -118,24 +152,58 @@ def parse_player_response():
             continue
         try:
             obj, _ = decoder.raw_decode(html[start:])
-            ps = obj.get("playabilityStatus") or {}
-            vd = obj.get("videoDetails") or {}
-            sd = obj.get("streamingData") or {}
-            caps = ((obj.get("captions") or {}).get("playerCaptionsTracklistRenderer") or {})
-            result = {
-                "found": True,
-                "marker": marker,
-                "playability": {"status": ps.get("status"), "reason": ps.get("reason"), "playableInEmbed": ps.get("playableInEmbed")},
-                "video": {"videoId": vd.get("videoId"), "title": vd.get("title"), "author": vd.get("author"), "lengthSeconds": vd.get("lengthSeconds")},
-                "streamingData_present": bool(sd),
-                "formats": len((sd.get("formats") or []) + (sd.get("adaptiveFormats") or [])),
-                "captions": len(caps.get("captionTracks") or []),
-            }
-            (OUT / "player-summary.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), "utf-8")
-            return result
+            return obj, marker
         except Exception:
             pass
-    return {"found": False}
+    return None, None
+
+
+def parse_and_probe_player_response():
+    obj, marker = extract_player_response()
+    if not obj:
+        return {"found": False}
+    ps = obj.get("playabilityStatus") or {}
+    vd = obj.get("videoDetails") or {}
+    sd = obj.get("streamingData") or {}
+    caps = ((obj.get("captions") or {}).get("playerCaptionsTracklistRenderer") or {})
+    formats = (sd.get("formats") or []) + (sd.get("adaptiveFormats") or [])
+    direct = [f for f in formats if f.get("url")]
+    ciphered = [f for f in formats if f.get("signatureCipher") or f.get("cipher")]
+    selected = []
+    progressive = [f for f in (sd.get("formats") or []) if f.get("url")]
+    video_only = [f for f in (sd.get("adaptiveFormats") or []) if f.get("url") and str(f.get("mimeType", "")).startswith("video/")]
+    audio_only = [f for f in (sd.get("adaptiveFormats") or []) if f.get("url") and str(f.get("mimeType", "")).startswith("audio/")]
+    for label, pool in (("progressive", progressive), ("video", video_only), ("audio", audio_only)):
+        if pool:
+            f = pool[0]
+            try:
+                probe = probe_range(f["url"], f"media-{label}")
+            except Exception as e:
+                probe = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            selected.append({
+                "kind": label,
+                "itag": f.get("itag"),
+                "mimeType": f.get("mimeType"),
+                "width": f.get("width"),
+                "height": f.get("height"),
+                "fps": f.get("fps"),
+                "audioQuality": f.get("audioQuality"),
+                "probe": probe,
+            })
+    result = {
+        "found": True,
+        "marker": marker,
+        "playability": {"status": ps.get("status"), "reason": ps.get("reason"), "playableInEmbed": ps.get("playableInEmbed")},
+        "video": {"videoId": vd.get("videoId"), "title": vd.get("title"), "author": vd.get("author"), "lengthSeconds": vd.get("lengthSeconds")},
+        "streamingData_present": bool(sd),
+        "format_count": len(formats),
+        "direct_url_formats": len(direct),
+        "ciphered_formats": len(ciphered),
+        "captions": len(caps.get("captionTracks") or []),
+        "media_probes": selected,
+    }
+    (OUT / "player-summary.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), "utf-8")
+    return result
 
 
 def build_routes(target, vid):
@@ -186,7 +254,7 @@ def main():
             results[name] = result
             print(name, "OK" if result.get("ok") else "FAIL", result.get("status", ""), result.get("bytes", ""), result.get("error", ""))
 
-    extra = {"player_response": parse_player_response() if vid else None}
+    extra = {"player_response": parse_and_probe_player_response() if vid else None}
     if vid and results.get("youtube-oembed", {}).get("ok") and (OUT / "youtube-oembed.txt").exists():
         try:
             extra["oembed"] = json.loads((OUT / "youtube-oembed.txt").read_text("utf-8"))
