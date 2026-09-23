@@ -8,146 +8,18 @@ permissions:
   contents: read
 
 jobs:
-  diagnose:
+  fetch:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Prepare
-        run: |
-          mkdir -p out
-          echo 'https://www.youtube.com/watch?v=GKNS4cNavZU' > out/target.txt
-          uname -a > out/runner.txt
+      - uses: actions/checkout@v4
 
-      - name: Direct HTTP probe
+      - name: Fetch target
         continue-on-error: true
         run: |
-          set +e
-          curl -L --max-time 25 -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36' \
-            -H 'Accept-Language: ko-KR,ko;q=0.9,en;q=0.8' \
-            -D out/youtube-headers.txt \
-            -o out/youtube.html \
-            'https://www.youtube.com/watch?v=GKNS4cNavZU'
-          echo $? > out/curl-exit.txt
-          wc -c out/youtube.html >> out/curl-exit.txt 2>/dev/null || true
-
-      - name: Parse ytInitialPlayerResponse
-        continue-on-error: true
-        run: |
-          python - <<'PY'
-          import json, pathlib
-          html = pathlib.Path('out/youtube.html').read_text('utf-8', errors='replace')
-          markers = [
-              'var ytInitialPlayerResponse = ',
-              'ytInitialPlayerResponse = ',
-              'window["ytInitialPlayerResponse"] = ',
-              'ytInitialPlayerResponse":'
-          ]
-          decoder = json.JSONDecoder()
-          found = None
-          used = None
-          for marker in markers:
-              pos = html.find(marker)
-              if pos < 0:
-                  continue
-              start = html.find('{', pos + len(marker))
-              if start < 0:
-                  continue
-              try:
-                  obj, end = decoder.raw_decode(html[start:])
-                  found = obj
-                  used = marker
-                  break
-              except Exception:
-                  continue
-          summary = {
-              'found': bool(found),
-              'marker': used,
-              'html_bytes': len(html.encode('utf-8', errors='ignore')),
-          }
-          if found:
-              vd = found.get('videoDetails') or {}
-              ps = found.get('playabilityStatus') or {}
-              mf = ((found.get('microformat') or {}).get('playerMicroformatRenderer') or {})
-              caps = ((found.get('captions') or {}).get('playerCaptionsTracklistRenderer') or {})
-              sd = found.get('streamingData') or {}
-              formats = (sd.get('formats') or []) + (sd.get('adaptiveFormats') or [])
-              summary.update({
-                  'videoDetails': {
-                      'videoId': vd.get('videoId'),
-                      'title': vd.get('title'),
-                      'author': vd.get('author'),
-                      'channelId': vd.get('channelId'),
-                      'lengthSeconds': vd.get('lengthSeconds'),
-                      'viewCount': vd.get('viewCount'),
-                      'isLiveContent': vd.get('isLiveContent'),
-                      'shortDescription': (vd.get('shortDescription') or '')[:1000],
-                  },
-                  'playabilityStatus': {
-                      'status': ps.get('status'),
-                      'reason': ps.get('reason'),
-                      'playableInEmbed': ps.get('playableInEmbed'),
-                  },
-                  'publishDate': mf.get('publishDate'),
-                  'uploadDate': mf.get('uploadDate'),
-                  'captionTracks': [
-                      {
-                          'name': (((x.get('name') or {}).get('simpleText')) or ''),
-                          'languageCode': x.get('languageCode'),
-                          'kind': x.get('kind'),
-                          'baseUrl_present': bool(x.get('baseUrl')),
-                      }
-                      for x in (caps.get('captionTracks') or [])
-                  ],
-                  'streamingData_present': bool(sd),
-                  'format_count': len(formats),
-                  'formats': [
-                      {
-                          'itag': f.get('itag'),
-                          'mimeType': f.get('mimeType'),
-                          'width': f.get('width'),
-                          'height': f.get('height'),
-                          'fps': f.get('fps'),
-                          'audioQuality': f.get('audioQuality'),
-                          'url_present': bool(f.get('url')),
-                          'signatureCipher_present': bool(f.get('signatureCipher') or f.get('cipher')),
-                      }
-                      for f in formats[:30]
-                  ],
-              })
-              pathlib.Path('out/player-response.json').write_text(json.dumps(found, ensure_ascii=False), 'utf-8')
-          pathlib.Path('out/player-summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), 'utf-8')
-          print(json.dumps(summary, ensure_ascii=False, indent=2))
-          PY
-
-      - name: Official oEmbed
-        continue-on-error: true
-        run: |
-          curl -L --max-time 20 -o out/oembed.json 'https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=GKNS4cNavZU&format=json'
-
-      - name: Thumbnail CDN
-        continue-on-error: true
-        run: |
-          curl -L --max-time 20 -D out/thumb-headers.txt -o out/thumb.jpg 'https://i.ytimg.com/vi/GKNS4cNavZU/hqdefault.jpg'
-          file out/thumb.jpg > out/thumb-file.txt 2>&1 || true
-
-      - name: yt-dlp fallback diagnostic
-        continue-on-error: true
-        run: |
-          python -m pip install -q yt-dlp
-          python -m yt_dlp --skip-download --dump-single-json --no-warnings 'https://www.youtube.com/watch?v=GKNS4cNavZU' > out/yt-dlp.json 2> out/yt-dlp.err
-
-      - name: Summarize
-        if: always()
-        run: |
-          {
-            echo '=== curl ==='
-            cat out/curl-exit.txt 2>/dev/null || true
-            echo '=== parsed player ==='
-            cat out/player-summary.json 2>/dev/null || true
-            echo
-            echo '=== yt-dlp fallback ==='
-            cat out/yt-dlp.err 2>/dev/null || true
-          } | tee out/summary.txt
+          rm -rf out
+          python tools/fetch_probe.py | tee fetch-run.log
+          cp fetch-run.log out/fetch-run.log 2>/dev/null || true
 
       - name: Upload diagnostics
         if: always()
