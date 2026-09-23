@@ -1,0 +1,67 @@
+name: Fetch Lab
+
+on:
+  push:
+    branches: [fetch-lab]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Prepare
+        run: |
+          mkdir -p out
+          echo 'https://www.youtube.com/watch?v=GKNS4cNavZU' > out/target.txt
+          uname -a > out/runner.txt
+
+      - name: Direct HTTP probe
+        continue-on-error: true
+        run: |
+          set +e
+          curl -L --max-time 25 -A 'Mozilla/5.0' -D out/youtube-headers.txt -o out/youtube.html 'https://www.youtube.com/watch?v=GKNS4cNavZU'
+          echo $? > out/curl-exit.txt
+          wc -c out/youtube.html >> out/curl-exit.txt 2>/dev/null || true
+
+      - name: Official oEmbed
+        continue-on-error: true
+        run: |
+          curl -L --max-time 20 -o out/oembed.json 'https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=GKNS4cNavZU&format=json'
+
+      - name: Thumbnail CDN
+        continue-on-error: true
+        run: |
+          curl -L --max-time 20 -D out/thumb-headers.txt -o out/thumb.jpg 'https://i.ytimg.com/vi/GKNS4cNavZU/hqdefault.jpg'
+          file out/thumb.jpg > out/thumb-file.txt 2>&1 || true
+
+      - name: yt-dlp metadata
+        continue-on-error: true
+        run: |
+          python -m pip install -q yt-dlp
+          python -m yt_dlp --skip-download --dump-single-json --no-warnings 'https://www.youtube.com/watch?v=GKNS4cNavZU' > out/yt-dlp.json 2> out/yt-dlp.err
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo '=== files ==='
+            ls -lah out
+            echo '=== curl ==='
+            cat out/curl-exit.txt 2>/dev/null || true
+            echo '=== oembed ==='
+            head -c 2000 out/oembed.json 2>/dev/null || true
+            echo
+            echo '=== yt-dlp error ==='
+            cat out/yt-dlp.err 2>/dev/null || true
+          } | tee out/summary.txt
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fetch-lab-results
+          path: out/
+          retention-days: 1
